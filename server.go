@@ -2,306 +2,447 @@
 package turnpike
 
 import (
-	"code.google.com/p/go.net/websocket"
-	"encoding/json"
-	log "github.com/jcelliott/lumber"
-	"github.com/nu7hatch/gouuid"
-	"io"
-	"sync"
-	"turnpike/wamp"
+    "code.google.com/p/go.net/websocket"
+    "encoding/json"
+    "github.com/nu7hatch/gouuid"
+    "io"
+    "net"
+    "sync"
+    "time"
 )
 
-func init() {
-	log.Level(log.TRACE)
-}
+var (
+    serverBacklog = 20
+)
+
+const (
+    CLIENT_CONN_TIMEOUT = 6
+    CLIENT_MAX_FAILURES = 3
+)
 
 type RPCError interface {
-	error
-	URI() string
-	Description() string
-	Details() interface{}
+    error
+    URI() string
+    Description() string
+    Details() interface{}
 }
 
 type listenerMap map[string]bool
 
 func (lm listenerMap) Add(id string) {
-	lm[id] = true
+    lm[id] = true
 }
+
 func (lm listenerMap) Contains(id string) bool {
-	return lm[id]
+    return lm[id]
 }
+
 func (lm listenerMap) Remove(id string) {
-	delete(lm, id)
+    delete(lm, id)
 }
 
 // this may be broken in v2 if multiple-return is implemented
 type RPCHandler func(string, string, ...interface{}) (interface{}, error)
 
-var serverBacklog = 10
-
 type Server struct {
-	clients map[string]chan<- string
-	// this is a map because it cheaply prevents a client from subscribing multiple times
-	// the nice side-effect here is it's easy to unsubscribe
-	//               topicID  clients
-	subscriptions map[string]listenerMap
-	//           client    prefixes
-	prefixes map[string]wamp.PrefixMap
-	rpcHooks map[string]RPCHandler
-	subLock  *sync.Mutex
+    clients map[string]chan string
+    Rooms RoomsMap
+    // this is a map because it cheaply prevents a client from subscribing multiple times
+    // the nice side-effect here is it's easy to unsubscribe
+    //               topicID  clients
+    subscriptions map[string]listenerMap
+    //           client    prefixes
+    prefixes map[string]PrefixMap
+    rpcHooks map[string]RPCHandler
+    subLock  *sync.Mutex
 }
 
 func NewServer() *Server {
-	return &Server{
-		clients:       make(map[string]chan<- string),
-		subscriptions: make(map[string]listenerMap),
-		prefixes:      make(map[string]wamp.PrefixMap),
-		rpcHooks:      make(map[string]RPCHandler),
-		subLock:       new(sync.Mutex)}
+    return &Server{
+        clients:       make(map[string]chan string),
+        Rooms:         make(RoomsMap),
+        subscriptions: make(map[string]listenerMap),
+        prefixes:      make(map[string]PrefixMap),
+        rpcHooks:      make(map[string]RPCHandler),
+        subLock:       new(sync.Mutex)}
 }
 
-func (t *Server) handlePrefix(id string, msg wamp.PrefixMsg) {
-	log.Trace("Handling prefix message")
-	if _, ok := t.prefixes[id]; !ok {
-		t.prefixes[id] = make(wamp.PrefixMap)
-	}
-	if err := t.prefixes[id].RegisterPrefix(msg.Prefix, msg.URI); err != nil {
-		log.Error("Error registering prefix: %s", err)
-	}
-	log.Debug("Client %s registered prefix '%s' for URI: %s", id, msg.Prefix, msg.URI)
+func (t *Server) handlePrefix(id string, msg PrefixMsg) {
+    log.Trace("turnpike: handling prefix message %s", msg.Prefix)
+    if _, ok := t.prefixes[id]; !ok {
+        t.prefixes[id] = make(PrefixMap)
+    }
+    if err := t.prefixes[id].RegisterPrefix(msg.Prefix, msg.URI); err != nil {
+        log.Error("turnpike: error registering prefix: %s", err)
+    }
+    log.Debug("turnpike: client %s registered prefix '%s' for URI: %s", id, msg.Prefix, msg.URI)
 }
 
-func (t *Server) handleCall(id string, msg wamp.CallMsg) {
-	log.Trace("Handling call message")
-	var out string
-	var err error
+func (t *Server) handleCall(id string, msg CallMsg) {
+    log.Trace("turnpike: handling call message")
+    var out string
+    var err error
 
-	if f, ok := t.rpcHooks[msg.ProcURI]; ok && f != nil {
-		var res interface{}
-		res, err = f(id, msg.ProcURI, msg.CallArgs...)
-		if err != nil {
-			var errorURI, desc string
-			var details interface{}
-			if er, ok := err.(RPCError); ok {
-				errorURI = er.URI()
-				desc = er.Description()
-				details = er.Details()
-			} else {
-				errorURI = msg.ProcURI + "#generic-error"
-				desc = err.Error()
-			}
+    if f, ok := t.rpcHooks[msg.ProcURI]; ok && f != nil {
+        var res interface{}
+        res, err = f(id, msg.ProcURI, msg.CallArgs...)
+        if err != nil {
+            var errorURI, desc string
+            var details interface{}
+            if er, ok := err.(RPCError); ok {
+                errorURI = er.URI()
+                desc = er.Description()
+                details = er.Details()
+            } else {
+                errorURI = msg.ProcURI + "#generic-error"
+                desc = err.Error()
+            }
 
-			if details != nil {
-				out, err = wamp.CallError(msg.CallID, errorURI, desc, details)
-			} else {
-				out, err = wamp.CallError(msg.CallID, errorURI, desc)
-			}
-		} else {
-			out, err = wamp.CallResult(msg.CallID, res)
-		}
-	} else {
-		log.Warn("RPC call not registered: %s", msg.ProcURI)
-		out, err = wamp.CallError(msg.CallID, "error:notimplemented", "RPC call '%s' not implemented", msg.ProcURI)
-	}
+            if details != nil {
+                out, err = CreateCallError(msg.CallID, errorURI, desc, details)
+            } else {
+                out, err = CreateCallError(msg.CallID, errorURI, desc)
+            }
+        } else {
+            out, err = CreateCallResult(msg.CallID, res)
+        }
+    } else {
+        log.Warn("turnpike: RPC call not registered: %s", msg.ProcURI)
+        out, err = CreateCallError(msg.CallID, "error:notimplemented", "RPC call '%s' not implemented", msg.ProcURI)
+    }
 
-	if err != nil {
-		// whatever, let the client hang...
-		log.Fatal("Error creating callError message: %s", err)
-		return
-	}
-	if client, ok := t.clients[id]; ok {
-		client <- out
-	}
+    if err != nil {
+        // whatever, let the client hang...
+        log.Fatal("turnpike: error creating callError message: %s", err)
+        return
+    }
+    if client, ok := t.clients[id]; ok {
+        client <- out
+    }
 }
 
-func (t *Server) handleSubscribe(id string, msg wamp.SubscribeMsg) {
-	log.Trace("Handling subscribe message")
-	t.subLock.Lock()
-	topic := wamp.CheckCurie(t.prefixes[id], msg.TopicURI)
-	if _, ok := t.subscriptions[topic]; !ok {
-		t.subscriptions[topic] = make(map[string]bool)
-	}
-	t.subscriptions[topic].Add(id)
-	t.subLock.Unlock()
-	log.Debug("Client %s subscribed to topic: %s", id, topic)
+func (t *Server) handleSubscribe(id string, msg SubscribeMsg) {
+    log.Trace("turnpike: handling subscribe message")
+    t.subLock.Lock()
+    topic := CheckCurie(t.prefixes[id], msg.TopicURI)
+    subscribe := true
+
+    // Check to see if the client is allowed to connect
+    room, r := t.Rooms.Contains(msg.TopicURI)
+    if !r {
+        log.Error("turnpike: Room does not exist: %s", msg.TopicURI)
+        subscribe = false
+    } else {
+        if !room.Auth(id) {
+            log.Warn("turnpike: Token in use for client: %s in room: %s", id, msg.TopicURI)
+            subscribe = false
+        }        
+    }
+
+    if subscribe {
+        if _, ok := t.subscriptions[topic]; !ok {
+            t.subscriptions[topic] = make(map[string]bool)
+        }
+        t.subscriptions[topic].Add(id)
+    }
+
+    t.subLock.Unlock()
+    if subscribe {
+        log.Debug("turnpike: client %s subscribed to topic: %s", id, topic)
+    }
 }
 
-func (t *Server) handleUnsubscribe(id string, msg wamp.UnsubscribeMsg) {
-	log.Trace("Handling unsubscribe message")
-	t.subLock.Lock()
-	topic := wamp.CheckCurie(t.prefixes[id], msg.TopicURI)
-	if lm, ok := t.subscriptions[topic]; ok {
-		lm.Remove(id)
-	}
-	t.subLock.Unlock()
-	log.Debug("Client %s unsubscribed from topic: %s", id, topic)
+func (t *Server) handleUnsubscribe(id string, msg UnsubscribeMsg) {
+    log.Trace("turnpike: handling unsubscribe message")
+    t.subLock.Lock()
+    topic := CheckCurie(t.prefixes[id], msg.TopicURI)
+    if lm, ok := t.subscriptions[topic]; ok {
+        lm.Remove(id)
+        if room, ok := t.Rooms.Contains(msg.TopicURI); ok {
+            room.RemoveClient(id)
+        }
+    }
+    t.subLock.Unlock()
+    log.Debug("turnpike: client %s unsubscribed from topic: %s", id, topic)
 }
 
-func (t *Server) handlePublish(id string, msg wamp.PublishMsg) {
-	log.Trace("Handling publish message")
-	topic := wamp.CheckCurie(t.prefixes[id], msg.TopicURI)
-	lm, ok := t.subscriptions[topic]
-	if !ok {
-		return
-	}
 
-	out, err := wamp.Event(topic, msg.Event)
-	if err != nil {
-		log.Error("Error creating event message: %s", err)
-		return
-	}
+func (t *Server) handleAuth(id string, msg AuthMsg) {
+    log.Trace("turnpike: handling auth message")
+    t.subLock.Lock()
+    room, ok := t.Rooms.Contains(msg.RoomID)
+    if ok && !room.AddClient(msg.Token, id) {
+        // XXX: This will not print.
+        log.Warn("turnpike: client %s using token: %s in use", id, msg.Token)
+    }
+    t.subLock.Unlock()
+    if !ok {
+        log.Warn("turnpike: client %s tried to enter room: %s with token: %s", id, msg.RoomID, msg.Token)
+        return
+    }
+    log.Debug("turnpike: client %s authenticated with token: %s", id, msg.Token)
+}
 
-	var sendTo []string
-	if len(msg.ExcludeList) > 0 || len(msg.EligibleList) > 0 {
-		// this is super ugly, but I couldn't think of a better way...
-		for tid := range lm {
-			include := true
-			for _, _tid := range msg.ExcludeList {
-				if tid == _tid {
-					include = false
-					break
-				}
-			}
-			if include {
-				sendTo = append(sendTo, tid)
-			}
-		}
 
-		for _, tid := range msg.EligibleList {
-			include := true
-			for _, _tid := range sendTo {
-				if _tid == tid {
-					include = false
-					break
-				}
-			}
-			if include {
-				sendTo = append(sendTo, tid)
-			}
-		}
-	} else {
-		for tid := range lm {
-			if tid == id && msg.ExcludeMe {
-				continue
-			}
-			sendTo = append(sendTo, tid)
-		}
-	}
+func (t *Server) handlePublish(id string, msg PublishMsg) {
+    log.Trace("turnpike: handling publish message %s, %s, %s", id, msg.TopicURI, msg.Event)
+    topic := CheckCurie(t.prefixes[id], msg.TopicURI)
+    lm, ok := t.subscriptions[topic]
+    if !ok {
+        return
+    }
 
-	log.Debug("Sending event messages")
-	for _, tid := range sendTo {
-		// we're not locking anything, so we need
-		// to make sure the client didn't disconnecct in the
-		// last few nanoseconds...
-		if client, ok := t.clients[tid]; ok {
-			client <- string(out)
-		}
-	}
+    out, err := CreateEvent(topic, msg.Event)
+
+    if err != nil {
+        log.Error("turnpike: error creating event message: %s", err)
+        return
+    }
+
+    var sendTo []string
+
+    if len(msg.ExcludeList) > 0 && len(msg.EligibleList) > 0 {
+
+        log.Error("Cannot use both include and exclude lists! For now....")
+
+    } else if len(msg.ExcludeList) > 0 {
+        log.Debug("ExcludeList: %s", msg.ExcludeList)
+        for tid := range lm {
+            include := true
+            for _, _tid := range msg.ExcludeList {
+                if tid == _tid {
+                    include = false
+                    break
+                }
+            }
+            if include {
+                sendTo = append(sendTo, tid)
+            }
+        }
+    
+    } else if len(msg.EligibleList) > 0 {
+        log.Debug("EligibleList: %s", msg.EligibleList)
+        for tid := range lm {
+            include := false
+            for _, _tid := range msg.EligibleList {
+                if _tid == tid {
+                    include = true
+                    break
+                }
+            }
+            if include {
+                sendTo = append(sendTo, tid)
+            }
+        }
+
+    }  else {      
+        for tid := range lm {
+            if tid == id && msg.ExcludeMe {
+                continue
+            }
+            sendTo = append(sendTo, tid)
+        }
+    }
+
+    log.Debug("SendTO: %s", sendTo)
+
+    for _, tid := range sendTo {
+        // we're not locking anything, so we need
+        // to make sure the client didn't disconnecct in the
+        // last few nanoseconds...
+        if client, ok := t.clients[tid]; ok {
+            if len(client) == cap(client) {
+                <-client
+            }
+            client <- string(out)
+        }
+    }
+}
+
+func jsonDataCheck(data map[string]interface {}, key string, value string) bool {
+
+    if d, ok := data[key]; ok && d == value {
+        return true
+    }
+    return false
+
 }
 
 func (t *Server) HandleWebsocket(conn *websocket.Conn) {
-	defer conn.Close()
+    defer conn.Close()
 
-	log.Debug("Received websocket connection")
+    log.Debug("turnpike: received websocket connection")
 
-	tid, err := uuid.NewV4()
-	if err != nil {
-		log.Error("Could not create unique id, refusing client connection")
-		return
-	}
-	id := tid.String()
+    tid, err := uuid.NewV4()
+    if err != nil {
+        log.Error("turnpike: could not create unique id, refusing client connection")
+        return
+    }
+    id := tid.String()
+    log.Info("turnpike: client connected: %s", id)
 
-	arr, err := wamp.Welcome(id, TURNPIKE_SERVER_IDENT)
-	if err != nil {
-		log.Error("Error encoding welcome message")
-		return
-	}
-	log.Debug("Sending welcome message: %s", arr)
-	err = websocket.Message.Send(conn, string(arr))
-	if err != nil {
-		log.Error("Error sending welcome message, aborting connection: %s", err)
-		return
-	}
+    arr, err := CreateWelcome(id, TURNPIKE_SERVER_IDENT)
+    if err != nil {
+        log.Error("turnpike: error encoding welcome message")
+        return
+    }
+    log.Debug("turnpike: sending welcome message: %s", arr)
+    err = websocket.Message.Send(conn, string(arr))
+    if err != nil {
+        log.Error("turnpike: error sending welcome message, aborting connection: %s", err)
+        return
+    }
 
-	c := make(chan string, serverBacklog)
-	t.clients[id] = c
+    c := make(chan string, serverBacklog)
+    t.clients[id] = c
 
-	go func() {
-		for msg := range c {
-			log.Trace("Sending message: %s", msg)
-			err := websocket.Message.Send(conn, string(msg))
-			if err != nil {
-				log.Error("Error sending message: %s", err)
-			}
-		}
-	}()
+    failures := 0
+    go func() {
+        for msg := range c {
+            log.Trace("turnpike: sending message: %s", msg)
+            conn.SetWriteDeadline(time.Now().Add(CLIENT_CONN_TIMEOUT * time.Second))
+            err := websocket.Message.Send(conn, msg)
+            if err != nil {
+                if nErr, ok := err.(net.Error); ok && (nErr.Timeout() || nErr.Temporary()) {
+                    log.Warn("Network error: %s", nErr)
+                    failures++
+                    if failures > CLIENT_MAX_FAILURES {
+                        break
+                    }
+                } else {
+                    log.Error("turnpike: error sending message: %s", err)
+                    break
+                }
+            }
+        }
+        log.Info("Client %s disconnected", id)
+        t.subLock.Lock()
+        rooms := t.Rooms.FindClient(id)
+        t.subLock.Unlock()
+        for r := rooms.Front(); r != nil; r=r.Next() {
+            room := r.Value.(*Room)
+            room.RemoveClientByID(id)
+            log.Debug("Removing client %s from room", id)
+        }
+        conn.Close()
+    }()
 
-	for {
-		var rec string
-		err := websocket.Message.Receive(conn, &rec)
-		if err != nil {
-			if err != io.EOF {
-				log.Error("Error receiving message, aborting connection: %s", err)
-			}
-			break
-		}
-		log.Trace("Message received: %s", rec)
+    for {
+        var rec string
+        err := websocket.Message.Receive(conn, &rec)
+        if err != nil {
+            if err != io.EOF {
+                log.Error("turnpike: error receiving message, aborting connection: %s", err)
+            }
+            break
+        }
+        log.Trace("turnpike: message received: %s", rec)
 
-		data := []byte(rec)
+        data := []byte(rec)
 
-		switch typ := wamp.ParseType(rec); typ {
-		case wamp.PREFIX:
-			var msg wamp.PrefixMsg
-			err := json.Unmarshal(data, &msg)
-			if err != nil {
-				log.Error("Error unmarshalling prefix message: %s", err)
-			}
-			t.handlePrefix(id, msg)
-		case wamp.CALL:
-			var msg wamp.CallMsg
-			err := json.Unmarshal(data, &msg)
-			if err != nil {
-				log.Error("Error unmarshalling call message: %s", err)
-			}
-			t.handleCall(id, msg)
-		case wamp.SUBSCRIBE:
-			var msg wamp.SubscribeMsg
-			err := json.Unmarshal(data, &msg)
-			if err != nil {
-				log.Error("Error unmarshalling subscribe message: %s", err)
-			}
-			t.handleSubscribe(id, msg)
-		case wamp.UNSUBSCRIBE:
-			var msg wamp.UnsubscribeMsg
-			err := json.Unmarshal(data, &msg)
-			if err != nil {
-				log.Error("Error unmarshalling unsubscribe message: %s", err)
-			}
-			t.handleUnsubscribe(id, msg)
-		case wamp.PUBLISH:
-			var msg wamp.PublishMsg
-			err := json.Unmarshal(data, &msg)
-			if err != nil {
-				log.Error("Error unmarshalling publish message: %s", err)
-			}
-			t.handlePublish(id, msg)
-		case wamp.WELCOME, wamp.CALLRESULT, wamp.CALLERROR, wamp.EVENT:
-			log.Error("Server -> client message received, ignored: %s", wamp.TypeString(typ))
-		default:
-			log.Error("Invalid message format, message dropped: %s", data)
-		}
-	}
+        switch typ := ParseType(rec); typ {
+        case PREFIX:
+            var msg PrefixMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike: error unmarshalling prefix message: %s", err)
+                continue
+            }
+            t.handlePrefix(id, msg)
+        case CALL:
+            var msg CallMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike: error unmarshalling call message: %s", err)
+                continue
+            }
+            t.handleCall(id, msg)
+        case SUBSCRIBE:
+            var msg SubscribeMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike: error unmarshalling subscribe message: %s", err)
+                continue
+            }
+            // Check access
+            t.handleSubscribe(id, msg)
+        case UNSUBSCRIBE:
+            var msg UnsubscribeMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike: error unmarshalling unsubscribe message: %s", err)
+                continue
+            }
+            t.handleUnsubscribe(id, msg)
+        case PUBLISH:
+            var msg PublishMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike: error unmarshalling publish message: %s", err)
+                continue
+            }
+            // check master
+            room, r := t.Rooms.Contains(msg.TopicURI)
+            if !r {
+                log.Error("turnpike: Room does not exist: %s", msg.TopicURI)
+                return
+            }
+            if !room.IsMaster(id) {
+                if room.Auth(id) {
+                    if !jsonDataCheck(msg.Event.(map[string]interface{}), "type", "echo") {
+                        log.Trace("NOT ECHO Message")
+                        continue
+                    }
+                    log.Debug("ECHO Message Sent from client %s", id)
+                } else {
+                    log.Warn("Client %s not authenticated", id)
+                    continue
+                }
+            }
+            t.handlePublish(id, msg)
+        case AUTH:
+            var msg AuthMsg
+            err := json.Unmarshal(data, &msg)
+            if err != nil {
+                log.Error("turnpike AUTH: error unmarshalling publish message: %s", err)
+                continue
+            }
+            t.handleAuth(id, msg)        
+        case WELCOME, CALLRESULT, CALLERROR, EVENT:
+            log.Error("turnpike: server -> client message received, ignored: %s", TypeString(typ))
+        default:
+            log.Error("turnpike: invalid message format, message dropped: %s", data)
+        }
+    }
 
-	delete(t.clients, id)
-	close(c)
+    delete(t.clients, id)
+    close(c)
 }
 
 func (t *Server) RegisterRPC(uri string, f RPCHandler) {
-	if f != nil {
-		t.rpcHooks[uri] = f
-	}
+    if f != nil {
+        t.rpcHooks[uri] = f
+    }
 }
 
 func (t *Server) UnregisterRPC(uri string) {
-	delete(t.rpcHooks, uri)
+    delete(t.rpcHooks, uri)
+}
+
+func (t *Server) SendEvent(topic string, event interface{}) {
+    t.handlePublish(topic, PublishMsg{
+        TopicURI: topic,
+        Event:    event,
+    })
+}
+
+func (t *Server) RegisterRoom(roomID string, token string) bool {
+    log.Trace("Registering room")
+    if room, ok := t.Rooms[roomID]; !ok {
+        room = t.Rooms.Add(roomID, token)
+        (*room).AddToken("token1")
+        return true
+    } else {
+        return false
+    }
 }
