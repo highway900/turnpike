@@ -57,7 +57,7 @@ func (r *Room) AddClient(token string, clientID string) bool {
     } else if r.tokensMap[token] == NO_CLIENT {
         r.tokensMap[token] = clientID
         r.authMap[clientID] = true
-        fmt.Printf("AddClient clientID: %s\n", r.authMap[clientID])
+        fmt.Printf("AddClient clientID: %s\n", clientID)
         return true
     } else {
         return false

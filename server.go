@@ -2,13 +2,14 @@
 package turnpike
 
 import (
-    "code.google.com/p/go.net/websocket"
     "encoding/json"
-    "github.com/nu7hatch/gouuid"
     "io"
     "net"
     "sync"
     "time"
+    "github.com/googollee/go-rest/pubsub"
+    "github.com/nu7hatch/gouuid"
+    "code.google.com/p/go.net/websocket"
 )
 
 var (
@@ -55,6 +56,9 @@ type Server struct {
     prefixes map[string]PrefixMap
     rpcHooks map[string]RPCHandler
     subLock  *sync.Mutex
+
+    // Rest handler
+    RestPubsub *pubsub.Pubsub
 }
 
 func NewServer() *Server {
@@ -254,6 +258,7 @@ func (t *Server) handlePublish(id string, msg PublishMsg) {
             if len(client) == cap(client) {
                 <-client
             }
+            log.Debug("MSG: %s\n", out)
             client <- string(out)
         }
     }
@@ -301,7 +306,9 @@ func (t *Server) HandleWebsocket(conn *websocket.Conn) {
         for msg := range c {
             log.Trace("turnpike: sending message: %s", msg)
             conn.SetWriteDeadline(time.Now().Add(CLIENT_CONN_TIMEOUT * time.Second))
+
             err := websocket.Message.Send(conn, msg)
+            t.RestPublish(msg)
             if err != nil {
                 if nErr, ok := err.(net.Error); ok && (nErr.Timeout() || nErr.Temporary()) {
                     log.Warn("Network error: %s", nErr)
@@ -437,10 +444,10 @@ func (t *Server) SendEvent(topic string, event interface{}) {
 }
 
 func (t *Server) RegisterRoom(roomID string, token string) bool {
-    log.Trace("Registering room")
+    log.Trace("Registering room: %s, token: %s", roomID, token)
     if room, ok := t.Rooms[roomID]; !ok {
         room = t.Rooms.Add(roomID, token)
-        (*room).AddToken("token1")
+        (*room).AddToken(token)
         return true
     } else {
         return false
