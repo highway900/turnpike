@@ -7,7 +7,7 @@ import (
     "net"
     "sync"
     "time"
-    "github.com/googollee/go-rest/pubsub"
+    "reflect"
     "github.com/nu7hatch/gouuid"
     "code.google.com/p/go.net/websocket"
 )
@@ -58,7 +58,7 @@ type Server struct {
     subLock  *sync.Mutex
 
     // Rest handler
-    RestPubsub *pubsub.Pubsub
+    RestPublish func(string)
 }
 
 func NewServer() *Server {
@@ -258,7 +258,6 @@ func (t *Server) handlePublish(id string, msg PublishMsg) {
             if len(client) == cap(client) {
                 <-client
             }
-            log.Debug("MSG: %s\n", out)
             client <- string(out)
         }
     }
@@ -270,6 +269,86 @@ func jsonDataCheck(data map[string]interface {}, key string, value string) bool 
         return true
     }
     return false
+
+}
+
+func (t *Server) HandleMessage(id string, rec string) {
+
+    data := []byte(rec)
+
+    switch typ := ParseType(rec); typ {
+    case PREFIX:
+        var msg PrefixMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike: error unmarshalling prefix message: %s", err)
+            return
+        }
+        t.handlePrefix(id, msg)
+    case CALL:
+        var msg CallMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike: error unmarshalling call message: %s", err)
+            return
+        }
+        t.handleCall(id, msg)
+    case SUBSCRIBE:
+        var msg SubscribeMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike: error unmarshalling subscribe message: %s", err)
+            return
+        }
+        // Check access
+        t.handleSubscribe(id, msg)
+    case UNSUBSCRIBE:
+        var msg UnsubscribeMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike: error unmarshalling unsubscribe message: %s", err)
+            return
+        }
+        t.handleUnsubscribe(id, msg)
+    case PUBLISH:
+        var msg PublishMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike: error unmarshalling publish message: %s", err)
+            return
+        }
+        // check master
+        room, r := t.Rooms.Contains(msg.TopicURI)
+        if !r {
+            log.Error("turnpike: Room does not exist: %s", msg.TopicURI)
+            return
+        }
+        if !room.IsMaster(id) {
+            if room.Auth(id) {
+                if !jsonDataCheck(msg.Event.(map[string]interface{}), "type", "echo") {
+                    log.Trace("NOT ECHO Message")
+                    return
+                }
+                log.Debug("ECHO Message Sent from client %s", id)
+            } else {
+                log.Warn("Client %s not authenticated", id)
+                return
+            }
+        }
+        t.handlePublish(id, msg)
+    case AUTH:
+        var msg AuthMsg
+        err := json.Unmarshal(data, &msg)
+        if err != nil {
+            log.Error("turnpike AUTH: error unmarshalling publish message: %s", err)
+            return
+        }
+        t.handleAuth(id, msg)        
+    case WELCOME, CALLRESULT, CALLERROR, EVENT:
+        log.Error("turnpike: server -> client message received, ignored: %s", TypeString(typ))
+    default:
+        log.Error("turnpike: invalid message format, message dropped: %s", data)
+    }
 
 }
 
@@ -305,10 +384,13 @@ func (t *Server) HandleWebsocket(conn *websocket.Conn) {
     go func() {
         for msg := range c {
             log.Trace("turnpike: sending message: %s", msg)
-            conn.SetWriteDeadline(time.Now().Add(CLIENT_CONN_TIMEOUT * time.Second))
+            log.Trace("MSG: TYPE: %s", reflect.TypeOf(msg))
 
+            conn.SetWriteDeadline(time.Now().Add(CLIENT_CONN_TIMEOUT * time.Second))
             err := websocket.Message.Send(conn, msg)
-            t.RestPublish(msg)
+            // Do I figure out wheather there is clients connected to this service or not.
+            //t.RestPublish(msg)
+
             if err != nil {
                 if nErr, ok := err.(net.Error); ok && (nErr.Timeout() || nErr.Temporary()) {
                     log.Warn("Network error: %s", nErr)
@@ -345,81 +427,8 @@ func (t *Server) HandleWebsocket(conn *websocket.Conn) {
         }
         log.Trace("turnpike: message received: %s", rec)
 
-        data := []byte(rec)
+        t.HandleMessage(id, rec)
 
-        switch typ := ParseType(rec); typ {
-        case PREFIX:
-            var msg PrefixMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike: error unmarshalling prefix message: %s", err)
-                continue
-            }
-            t.handlePrefix(id, msg)
-        case CALL:
-            var msg CallMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike: error unmarshalling call message: %s", err)
-                continue
-            }
-            t.handleCall(id, msg)
-        case SUBSCRIBE:
-            var msg SubscribeMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike: error unmarshalling subscribe message: %s", err)
-                continue
-            }
-            // Check access
-            t.handleSubscribe(id, msg)
-        case UNSUBSCRIBE:
-            var msg UnsubscribeMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike: error unmarshalling unsubscribe message: %s", err)
-                continue
-            }
-            t.handleUnsubscribe(id, msg)
-        case PUBLISH:
-            var msg PublishMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike: error unmarshalling publish message: %s", err)
-                continue
-            }
-            // check master
-            room, r := t.Rooms.Contains(msg.TopicURI)
-            if !r {
-                log.Error("turnpike: Room does not exist: %s", msg.TopicURI)
-                return
-            }
-            if !room.IsMaster(id) {
-                if room.Auth(id) {
-                    if !jsonDataCheck(msg.Event.(map[string]interface{}), "type", "echo") {
-                        log.Trace("NOT ECHO Message")
-                        continue
-                    }
-                    log.Debug("ECHO Message Sent from client %s", id)
-                } else {
-                    log.Warn("Client %s not authenticated", id)
-                    continue
-                }
-            }
-            t.handlePublish(id, msg)
-        case AUTH:
-            var msg AuthMsg
-            err := json.Unmarshal(data, &msg)
-            if err != nil {
-                log.Error("turnpike AUTH: error unmarshalling publish message: %s", err)
-                continue
-            }
-            t.handleAuth(id, msg)        
-        case WELCOME, CALLRESULT, CALLERROR, EVENT:
-            log.Error("turnpike: server -> client message received, ignored: %s", TypeString(typ))
-        default:
-            log.Error("turnpike: invalid message format, message dropped: %s", data)
-        }
     }
 
     delete(t.clients, id)
